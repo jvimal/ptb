@@ -51,23 +51,24 @@ struct ptb_local {
 	int waiting;
 	u64 tokens;
 	struct list_head wait_node;
+
+	/* Virtual time */
+	struct hrtimer timer;
 };
 
 struct ptb_sched {
 	u32 rate;
 	u64 tokens;
-	u64 last_clocked;
 	struct ptb_rate_cfg rate_to_time;
 
 	struct Qdisc **qdiscs;
 	spinlock_t spinlock;
-	struct list_head waiters;
-	struct hrtimer timer;
-	struct Qdisc *next_qdisc;
 
 	/* Parameters */
-	u64 dt_ns;
 	int max_len;
+
+	/* Virtual time based approach */
+	u64 now, next;
 
 	struct Qdisc *sch;
 };
@@ -97,55 +98,23 @@ static unsigned int ptb_drop(struct Qdisc *sch)
 	return 0;
 }
 
-static inline void ptb_watchdog(struct ptb_sched *rl, u64 dt_ns)
+static inline void ptb_local_watchdog(struct ptb_local *q, u64 dt_ns)
 {
-	if(!hrtimer_active(&rl->timer)) {
-		hrtimer_start(&rl->timer, ktime_set(0, dt_ns),
-					  HRTIMER_MODE_REL);
+	if(!hrtimer_active(&q->timer)) {
+		hrtimer_start(&q->timer, ktime_set(0, dt_ns),
+			      HRTIMER_MODE_REL);
 	}
 }
 
-/* Called with rl->spinlock */
-static inline void ptb_clock(struct ptb_sched *rl)
-{
-	u64 ns = ktime_to_ns(ktime_get());
-	rl->tokens = min_t(s64, (ns - rl->last_clocked) + rl->tokens, rl->dt_ns);
-	rl->last_clocked = ns;
-}
+enum hrtimer_restart ptb_local_timeout(struct hrtimer *timer) {
+	struct ptb_local *q = container_of(timer, struct ptb_local, timer);
+	struct ptb_sched *rl = q->rl;
 
-enum hrtimer_restart ptb_timeout(struct hrtimer *timer)
-{
-	struct ptb_sched *rl = container_of(timer, struct ptb_sched, timer);
-	if(rl->next_qdisc) {
-		qdisc_unthrottled(rl->next_qdisc);
-		__netif_schedule(qdisc_root(rl->next_qdisc));
-	}
-	return HRTIMER_NORESTART;
-}
-
-static void ptb_ipi(void *info)
-{
-	struct ptb_local *q = (struct ptb_local *)info;
+	q->tokens += QUANTA;
 	qdisc_unthrottled(q->sch);
 	__netif_schedule(qdisc_root(q->sch));
-}
 
-/* Called with rl->spinlock */
-static inline void ptb_activate_queue(struct ptb_local *q)
-{
-	struct ptb_sched *rl = q->rl;
-	if(!q->waiting) {
-		q->waiting = 1;
-		list_add_tail(&q->wait_node, &rl->waiters);
-	}
-}
-
-static inline void ptb_deactivate_queue(struct ptb_local *q)
-{
-	if(q->waiting) {
-		q->waiting = 0;
-		list_del_init(&q->wait_node);
-	}
+	return HRTIMER_NORESTART;
 }
 
 /*
@@ -174,50 +143,29 @@ static inline int ptb_borrow_tokens(struct ptb_sched *rl,
 				    u64 min_tokens)
 {
 	int timeout = 1;
-	struct ptb_local *first = q;
-	u64 dt_ns = rl->dt_ns;
 	u64 quanta;
+	u64 now = ktime_to_ns(ktime_get());
+
+	if (qdisc_is_throttled(q->sch))
+		return timeout;
 
 	spin_lock(&rl->spinlock);
-	ptb_activate_queue(q);
-	ptb_clock(rl);
-
+	/* Virtual time */
 	quanta = QUANTA;
-	/* Service waters in fifo order */
-	first = list_first_entry(&rl->waiters, struct ptb_local, wait_node);
-	rl->next_qdisc = first->sch;
 
-	if(first == q) {
-		if(rl->tokens >= quanta) {
-			rl->tokens -= quanta;
-			q->tokens += quanta;
-			timeout = q->tokens < min_tokens;
-			ptb_deactivate_queue(q);
-			if(timeout) {
-				/* not done yet; add to end of queue */
-				qdisc_throttled(q->sch);
-				ptb_activate_queue(q);
-			}
-
-			/* Go to next qdisc */
-			if(!list_empty(&rl->waiters)) {
-				first = list_first_entry(&rl->waiters, struct ptb_local, wait_node);
-				rl->next_qdisc = first->sch;
-			}
-		} else {
-			u64 to_get = quanta - rl->tokens;
-			dt_ns = to_get;
-			qdisc_throttled(q->sch);
-		}
-
-		if(timeout) {
-			ptb_watchdog(rl, dt_ns);
-		}
+	if (rl->next < now) {
+		/* Transmit permitted, so this queue obtains a lease
+		 * to transmit from now to now + quanta. */
+		rl->next = now + quanta;
+		q->tokens += quanta;
+		timeout = 0;
 	} else {
-		/* Someone else is waiting. Send an IPI to that processor. */
-		int cpu = cpu_online(first->cpu) ? first->cpu : smp_processor_id();
-		smp_call_function_single(cpu, ptb_ipi, (void *)first, 0);
+		/* Transmit not permitted, so set up a timer. */
 		qdisc_throttled(q->sch);
+		ptb_local_watchdog(q, rl->next - now);
+		/* This queue will get to transmit from rl->next to
+		 * rl->next + quanta */
+		rl->next += quanta;
 	}
 
 	spin_unlock(&rl->spinlock);
@@ -303,11 +251,10 @@ static int ptb_change(struct Qdisc *sch, struct nlattr *opt)
 	tbf_precompute_ratedata(&rl->rate_to_time);
 
 	rl->rate = rate;
-	rl->dt_ns = l2t_ns(&rl->rate_to_time, PTB_MAX_PACKET_BYTES);
 	err = 0;
 
-	printk(KERN_INFO "ptb init: rate %llu b/s, dt_ns %llu\n",
-		   rl->rate_to_time.rate_bps, rl->dt_ns);
+	printk(KERN_INFO "ptb init: rate %llu b/s, time quantum %lluns\n",
+	       rl->rate_to_time.rate_bps, QUANTA);
  done:
 	return err;
 }
@@ -322,6 +269,10 @@ static int ptb_local_init(struct Qdisc *sch, struct nlattr *opt)
 	q->tokens = 0;
 	q->cpu = 0;
 	INIT_LIST_HEAD(&q->wait_node);
+
+	/* Virtual time */
+	hrtimer_init(&q->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	q->timer.function = ptb_local_timeout;
 	return 0;
 }
 
@@ -334,8 +285,6 @@ static void ptb_destroy(struct Qdisc *sch)
 	if(!rl->qdiscs)
 		return;
 
-	hrtimer_cancel(&rl->timer);
-
 	for(ntx = 0; ntx < dev->num_tx_queues && rl->qdiscs[ntx]; ntx++)
 		qdisc_destroy(rl->qdiscs[ntx]);
 
@@ -347,6 +296,7 @@ static void ptb_local_destroy(struct Qdisc *sch)
 {
 	struct ptb_local *q = qdisc_priv(sch);
 	skb_queue_purge(&q->list);
+	hrtimer_cancel(&q->timer);
 }
 
 static int ptb_dump(struct Qdisc *sch, struct sk_buff *skb)
@@ -457,13 +407,9 @@ static int ptb_init(struct Qdisc *sch, struct nlattr *opt)
 	spin_lock_init(&rl->spinlock);
 	rl->rate = 100;
 	rl->tokens = 0;
-	rl->last_clocked = ktime_to_ns(ktime_get());
 	rl->max_len = 128 * 1024;
 	rl->sch = sch;
-	INIT_LIST_HEAD(&rl->waiters);
-	hrtimer_init(&rl->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-	rl->timer.function = ptb_timeout;
-	rl->next_qdisc = NULL;
+	rl->next = ktime_to_ns(ktime_get());
 
 	for(ntx = 0; ntx < dev->num_tx_queues; ntx++) {
 		dev_queue = netdev_get_tx_queue(dev, ntx);
@@ -489,12 +435,13 @@ static int ptb_init(struct Qdisc *sch, struct nlattr *opt)
 
 static int __init ptb_module_init(void)
 {
-	if(register_qdisc(&ptb_qdisc_ops))
-		return 1;
+	int ret;
+	if((ret = register_qdisc(&ptb_qdisc_ops)))
+		return ret;
 
-	if(register_qdisc(&ptb_local_ops)) {
+	if((ret = register_qdisc(&ptb_local_ops))) {
 		unregister_qdisc(&ptb_qdisc_ops);
-		return 1;
+		return ret;
 	}
 
 	return 0;
