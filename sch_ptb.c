@@ -119,24 +119,23 @@ enum hrtimer_restart ptb_local_timeout(struct hrtimer *timer) {
 
 /*
  * If the local Qdisc's token count runs out, try to borrow from the
- * shared pool. Grabbing all tokens from the shared pool results in
- * some unfairness, where some queues are first in line, but the total
- * tokens available is just a few. So, each queue is granted at least
- * QUANTA tokens.
+ * shared pool.  We ensure fairness in a simple way by servicing
+ * waiters in first come first served basis.  The only assumption we
+ * make is that ktime_get() is synchronised across CPUs.
  *
- * The min_tokens argument is used to check whether the total tokens
- * is sufficient to transmit the first packet in the queue. If not,
- * the qdisc is throttled (in ptb_dequeue()), and a timer is set (in
- * ptb_watchdog()) so that the rate limiter can grab
- * QUANTA-rl->tokens.
+ * The design is as follows.  rl->next denotes the next _overall_
+ * permissible transmit time so that rate limits are never violated.
+ * Each queue basically obtains a `permit' to transmit from rl->next
+ * and rl->next+quantum.  If rl->next was less than current time, the
+ * queue can transmit immediately.  If not, it can transmit only after
+ * (rl->next - now) nanosec.
  *
- * Note: All backlogged queues will be serviced equally! So if you
- * have 3 flows, and 2 flows are hased to one queue, bandwidth
- * distribution between flows will be uneven.
- *
- * Second note: Backlogged queues will be unthrottled on the last CPU
- * they ran on. If that CPU isn't online, they will be unthrottled on
- * the current CPU.
+ * This automatically takes care of fairness.  So if multiple queues
+ * try to grab tokens, they will be serialised and serviced round
+ * robin.  The only disadvantage of this design to the previous design
+ * is that you need multiple timers, one per CPU.  Most server-class
+ * CPUs use lapic as clock event device, so it's in fact better to
+ * have one timer per CPU instead of CPUs sending IPIs to each other.
  */
 static inline int ptb_borrow_tokens(struct ptb_sched *rl,
 				    struct ptb_local *q,
